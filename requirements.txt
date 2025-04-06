@@ -1,6 +1,8 @@
 transformers
 torch
 newspaper3k
+lxml_html_clean
+googlesearch-python
 beautifulsoup4
 requests
 scikit-learn

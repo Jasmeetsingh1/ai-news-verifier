@@ -1,0 +1,7 @@
+transformers
+torch
+newspaper3k
+beautifulsoup4
+requests
+scikit-learn
+streamlit

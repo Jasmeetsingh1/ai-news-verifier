@@ -20,12 +20,14 @@ def clean_query(text):
     return text.strip().replace("\n", " ").replace(".", "").replace("?", "").replace("!", "")
 
 def classify_input(text_type, text):
-    if text_type == "url":
+    if text_type in ["claim", "url", "article"]:
+        return text_type
+    if is_url(text):
         return "url"
-    elif text_type == "article":
-        return "article"
-    elif text_type == "claim":
+    elif is_claim(text):
         return "claim"
+    elif is_full_article(text):
+        return "article"
     else:
         return "unknown"
 
@@ -38,21 +40,21 @@ def process_input(input_type, user_input):
         title, article_text = extract_article_text(user_input)
         if not article_text:
             print("❌ Failed to extract main article content.")
-            return "", []
+            return "", [], "", ""
         query = clean_query(article_text)
+
     elif input_type == "article":
         article_text = user_input
-        query = clean_query(user_input)
         title = "User Provided Article"
-    else:
-        article_text = user_input
         query = clean_query(user_input)
+
+    else:  # claim
+        article_text = user_input
         title = "User Claim"
+        query = clean_query(user_input)
 
     print("🔗 Getting related articles...")
     related_articles = get_related_articles_texts(query)
-
-    # Filter out any articles that failed to extract
     filtered_articles = [(url, t, txt) for url, t, txt in related_articles if txt]
 
     print(f"\n🗞️ {len(filtered_articles)} Related Articles fetched:\n")
@@ -61,12 +63,21 @@ def process_input(input_type, user_input):
         print(f"📌 Title: {art_title}")
         print(f"📝 Preview: {preview[:300]}...\n")
 
-    print("✅ Ready for fact extraction and comparison.\n")
-    return article_text, filtered_articles
+        # ⬇️ Summarize if it's a full article
+    if input_type in ["url", "article"]:
+        claim_summary = summarize_text(article_text, max_length=350, min_length=40)
+        print(f"\n🧾 Extracted Summary from Article:\n{claim_summary}\n")
+    else:
+        claim_summary = article_text
+        print(f"\n🧾 Using Claim Directly:\n{claim_summary}\n")
 
-def run_nli_inference(claim_or_text, related_articles):
+    return article_text, filtered_articles, input_type, claim_summary
+
+
+def run_nli_inference(claim_text, related_articles):
     print("\n🔍 Running Fact Comparison...\n")
     nli_model = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
+    verdicts = []
 
     for idx, (url, title, content) in enumerate(related_articles, 1):
         try:
@@ -78,13 +89,12 @@ def run_nli_inference(claim_or_text, related_articles):
                 candidate_labels=["ENTAILMENT", "CONTRADICTION", "NEUTRAL"],
                 hypothesis_template="{}",
                 multi_label=False,
-                hypothesis=claim_or_text
+                hypothesis=claim_text
             )
 
-            # Sort by confidence to get top label
-            top_result = sorted(result["scores"], reverse=True)[0]
-            top_label = result["labels"][result["scores"].index(top_result)]
-            confidence = round(top_result * 100, 2)
+            top_idx = result["scores"].index(max(result["scores"]))
+            top_label = result["labels"][top_idx]
+            confidence = round(result["scores"][top_idx] * 100, 2)
 
             if top_label == "ENTAILMENT" and confidence >= 70:
                 verdict = "✅ Supported"
@@ -93,20 +103,42 @@ def run_nli_inference(claim_or_text, related_articles):
             else:
                 verdict = "❓ Possibly Related / Unclear"
 
+            verdicts.append({
+                "url": url,
+                "title": title,
+                "label": top_label,
+                "confidence": confidence,
+                "verdict": verdict
+            })
+
             print(f"🔗 Article {idx}: {title}")
             print(f"🧠 Result: {verdict} (confidence: {confidence}%)\n")
 
         except Exception as e:
             print(f"❌ Failed to run inference for Article {idx}: {e}")
 
+    return verdicts
+
+def final_verdict(verdicts):
+    support = sum(1 for v in verdicts if v['label'] == 'ENTAILMENT' and v['confidence'] >= 70)
+    refute = sum(1 for v in verdicts if v['label'] == 'CONTRADICTION' and v['confidence'] >= 70)
+
+    if support > refute:
+        return "✅ Likely True"
+    elif refute > support:
+        return "❌ Likely False"
+    else:
+        return "❓ Unclear or Inconclusive"
+
 # ✅ For testing only
 if __name__ == "__main__":
-    user_choice = input("What are you entering? [claim/article/url]: ").strip().lower()
+    user_choice = input("What are you entering? [claim/article/url/auto]: ").strip().lower()
     user_input = input("🧾 Paste your input (URL, article or claim):\n")
-    main_article, other_articles = process_input(user_choice, user_input)
 
-    if main_article:
-        print(f"\n📄 Main Article:\n{main_article[:500]}...")
-        run_nli_inference(main_article, other_articles)
+    main_article, related_articles, input_type, claim_summary = process_input(user_choice, user_input)
 
-
+    if main_article and related_articles:
+        print(f"\n🧾 Extracted Claim for Fact-Check:\n{claim_summary}\n")
+        verdicts = run_nli_inference(claim_summary, related_articles)
+        conclusion = final_verdict(verdicts)
+        print(f"\n🔚 Final Verdict: {conclusion}")

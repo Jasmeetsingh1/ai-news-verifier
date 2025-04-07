@@ -1,144 +1,109 @@
 from transformers import pipeline
-import re
-from scraper import extract_article_text, get_related_articles_texts
-from summarizer import summarize_text
+from sentence_transformers import SentenceTransformer, util
+from factextractor import extract_facts_from_text, extract_text_from_url
+from scraper import process_input
+import torch
 
-def is_url(text):
-    return re.match(r'https?://', text.strip()) is not None
+# Load models
+device = 0 if torch.cuda.is_available() else -1
+nli_model = pipeline("text-classification", model="microsoft/deberta-large-mnli", device=device)
+semantic_model = SentenceTransformer("intfloat/e5-large-v2", device=device)
 
-def is_claim(text):
-    return len(text.split()) <= 10
+def filter_by_semantic_similarity(claims, evidence_sentences, threshold=0.6, top_k=3):
+    """Filter evidence by semantic similarity to the claim."""
+    results = []
+    for claim in claims:
+        claim_embed = semantic_model.encode(claim, convert_to_tensor=True)
+        evidence_embed = semantic_model.encode(evidence_sentences, convert_to_tensor=True)
+        scores = util.pytorch_cos_sim(claim_embed, evidence_embed)[0]
+        top_results = torch.topk(scores, k=min(top_k, len(scores)))
+        selected = [(evidence_sentences[i], scores[i].item()) for i in top_results.indices if scores[i] >= threshold]
+        results.append((claim, selected))
+    return results
 
-def is_full_article(text):
-    num_words = len(text.split())
-    num_sentences = text.count('.') + text.count('!') + text.count('?')
-    return num_words > 50 or num_sentences > 3
-
-def clean_query(text):
-    if not text:
-        return ""
-    return text.strip().replace("\n", " ").replace(".", "").replace("?", "").replace("!", "")
-
-def classify_input(text_type, text):
-    if text_type in ["claim", "url", "article"]:
-        return text_type
-    if is_url(text):
-        return "url"
-    elif is_claim(text):
-        return "claim"
-    elif is_full_article(text):
-        return "article"
-    else:
-        return "unknown"
-
-def process_input(input_type, user_input):
-    input_type = classify_input(input_type, user_input)
-    print(f"🔍 Detected input type: {input_type}")
-
-    if input_type == "url":
-        print("📰 Extracting article from URL...")
-        title, article_text = extract_article_text(user_input)
-        if not article_text:
-            print("❌ Failed to extract main article content.")
-            return "", [], "", ""
-        query = clean_query(article_text)
-
-    elif input_type == "article":
-        article_text = user_input
-        title = "User Provided Article"
-        query = clean_query(user_input)
-
-    else:  # claim
-        article_text = user_input
-        title = "User Claim"
-        query = clean_query(user_input)
-
-    print("🔗 Getting related articles...")
-    related_articles = get_related_articles_texts(query)
-    filtered_articles = [(url, t, txt) for url, t, txt in related_articles if txt]
-
-    print(f"\n🗞️ {len(filtered_articles)} Related Articles fetched:\n")
-    for idx, (url, art_title, preview) in enumerate(filtered_articles, 1):
-        print(f"🔗 Article {idx}: {url}")
-        print(f"📌 Title: {art_title}")
-        print(f"📝 Preview: {preview[:300]}...\n")
-
-        # ⬇️ Summarize if it's a full article
-    if input_type in ["url", "article"]:
-        claim_summary = summarize_text(article_text, max_length=350, min_length=40)
-        print(f"\n🧾 Extracted Summary from Article:\n{claim_summary}\n")
-    else:
-        claim_summary = article_text
-        print(f"\n🧾 Using Claim Directly:\n{claim_summary}\n")
-
-    return article_text, filtered_articles, input_type, claim_summary
-
-
-def run_nli_inference(claim_text, related_articles):
-    print("\n🔍 Running Fact Comparison...\n")
-    nli_model = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
+def fact_check(claims, related_articles, sim_threshold=0.6):
     verdicts = []
 
-    for idx, (url, title, content) in enumerate(related_articles, 1):
-        try:
-            if len(content.split()) > 400:
-                content = summarize_text(content, max_length=350, min_length=40)
+    for url, title in related_articles:
+        content = extract_text_from_url(url)
+        if not content:
+            continue
 
-            result = nli_model(
-                sequences=content,
-                candidate_labels=["ENTAILMENT", "CONTRADICTION", "NEUTRAL"],
-                hypothesis_template="{}",
-                multi_label=False,
-                hypothesis=claim_text
-            )
+        evidence = extract_facts_from_text(content, num_facts=5)
+        semantic_filtered = filter_by_semantic_similarity(claims, evidence, threshold=sim_threshold)
 
-            top_idx = result["scores"].index(max(result["scores"]))
-            top_label = result["labels"][top_idx]
-            confidence = round(result["scores"][top_idx] * 100, 2)
+        for claim, similar_evidences in semantic_filtered:
+            for evidence_text, sim_score in similar_evidences:
+                try:
+                    result = nli_model(f"{claim} </s> {evidence_text}")[0]
+                    label = result["label"]
+                    score = round(result["score"] * 100, 2)
 
-            if top_label == "ENTAILMENT" and confidence >= 70:
-                verdict = "✅ Supported"
-            elif top_label == "CONTRADICTION" and confidence >= 70:
-                verdict = "❌ Not Supported / Refuted"
-            else:
-                verdict = "❓ Possibly Related / Unclear"
+                    if label == "ENTAILMENT" and score >= 70:
+                        verdict = "✅ Supported"
+                    elif label == "CONTRADICTION" and score >= 70:
+                        verdict = "❌ Refuted"
+                    else:
+                        verdict = "❓ Unclear"
 
-            verdicts.append({
-                "url": url,
-                "title": title,
-                "label": top_label,
-                "confidence": confidence,
-                "verdict": verdict
-            })
-
-            print(f"🔗 Article {idx}: {title}")
-            print(f"🧠 Result: {verdict} (confidence: {confidence}%)\n")
-
-        except Exception as e:
-            print(f"❌ Failed to run inference for Article {idx}: {e}")
-
+                    verdicts.append({
+                        "claim": claim,
+                        "evidence": evidence_text,
+                        "similarity": round(sim_score * 100, 2),
+                        "url": url,
+                        "source_title": title,
+                        "verdict": verdict,
+                        "confidence": score
+                    })
+                except Exception as e:
+                    print(f"NLI failed: {e}")
     return verdicts
 
-def final_verdict(verdicts):
-    support = sum(1 for v in verdicts if v['label'] == 'ENTAILMENT' and v['confidence'] >= 70)
-    refute = sum(1 for v in verdicts if v['label'] == 'CONTRADICTION' and v['confidence'] >= 70)
+def compute_final_verdict(verdicts):
+    supported = [v for v in verdicts if v["verdict"] == "✅ Supported"]
+    refuted = [v for v in verdicts if v["verdict"] == "❌ Refuted"]
 
-    if support > refute:
-        return "✅ Likely True"
-    elif refute > support:
-        return "❌ Likely False"
+    if len(supported) > len(refuted):
+        avg_conf = sum(v["confidence"] for v in supported) / len(supported)
+        return "✅ Likely True", min(95, max(50, int(avg_conf)))
+    elif len(refuted) > len(supported):
+        avg_conf = sum(v["confidence"] for v in refuted) / len(refuted)
+        return "❌ Likely False", min(95, max(20, int(avg_conf)))
     else:
-        return "❓ Unclear or Inconclusive"
+        return "❓ Unclear", 45
 
-# ✅ For testing only
 if __name__ == "__main__":
-    user_choice = input("What are you entering? [claim/article/url/auto]: ").strip().lower()
-    user_input = input("🧾 Paste your input (URL, article or claim):\n")
+    user_input = input("Paste claim, article, or URL:\n").strip()
+    related_articles = process_input(user_input)
 
-    main_article, related_articles, input_type, claim_summary = process_input(user_choice, user_input)
+    if not related_articles:
+        print("❌ Could not fetch related articles.")
+        exit()
 
-    if main_article and related_articles:
-        print(f"\n🧾 Extracted Claim for Fact-Check:\n{claim_summary}\n")
-        verdicts = run_nli_inference(claim_summary, related_articles)
-        conclusion = final_verdict(verdicts)
-        print(f"\n🔚 Final Verdict: {conclusion}")
+    # Limit to top 3 related articles
+    related_articles = related_articles[:3]
+
+    if user_input.startswith("http"):
+        input_text = extract_text_from_url(user_input)
+    elif len(user_input) < 50:
+        input_text = user_input
+    else:
+        input_text = user_input
+
+    claims = extract_facts_from_text(input_text, num_facts=3 if len(user_input) > 50 else 1)
+    print("\n🔍 Extracted Claims:")
+    for i, c in enumerate(claims, 1):
+        print(f"{i}. {c}")
+
+    verdicts = fact_check(claims, related_articles)
+    final_verdict, credibility = compute_final_verdict(verdicts)
+
+    print("\n📊 Fact-Check Summary:")
+    for v in verdicts:
+        print(f"🧠 Claim: {v['claim']}")
+        print(f"📜 Evidence: {v['evidence']}")
+        print(f"🔗 Source: {v['url']}")
+        print(f"🤖 Verdict: {v['verdict']} ({v['confidence']}%)\n")
+
+    print(f"🔚 Final Verdict: {final_verdict}")
+    print(f"📊 Credibility Score: {credibility}/100")

@@ -4,7 +4,7 @@ import time
 
 def search_google_news(query, num_results=5):
     search_results = []
-    query += " site:indiatimes.com OR site:thehindu.com OR site:ndtv.com"
+    query += " site:indiatimes.com OR site:thehindu.com OR site:ndtv.com OR site:timesofindia.indiatimes.com"
     for i, result in enumerate(search(query)):
         if i >= num_results:
             break
@@ -18,17 +18,29 @@ def extract_article_text(url):
         article = Article(url, config=config)
         article.download()
         article.parse()
-        return article.text
+        return article.title, article.text
     except Exception as e:
         print(f"❌ Failed to extract article from {url}: {e}")
-        return None
+        return None, None
 
-if __name__ == "__main__":
-    query = "India electoral bonds Supreme Court"
-    urls = search_google_news(query)
-    print("🔗 Found URLs:", urls)
-
+def get_related_articles_texts(query, num_results=5):
+    urls = search_google_news(query, num_results)
+    articles = []
     for url in urls:
-        print(f"\n📰 Article from: {url}")
-        print(extract_article_text(url))
+        title, text = extract_article_text(url)
+        if text:
+            articles.append((url, title, text))
         time.sleep(1)
+    return articles
+
+# ✅ Test block
+if __name__ == "__main__":
+    query = input("🔍 Enter a search query: ")
+    print(f"\n📡 Searching for articles related to: {query}\n")
+    articles = get_related_articles_texts(query)
+
+    print(f"\n🗞️ {len(articles)} articles fetched.\n")
+    for idx, (url, title, text) in enumerate(articles, 1):
+        print(f"🔗 Article {idx}: {url}")
+        print(f"📌 Title: {title}")
+        print(f"📝 Preview: {text[:300]}...\n")

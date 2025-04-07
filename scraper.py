@@ -1,5 +1,5 @@
 from googlesearch import search
-from newspaper import Article
+from newspaper import Article, Config
 import time
 
 def search_google_news(query, num_results=5):
@@ -13,7 +13,9 @@ def search_google_news(query, num_results=5):
 
 def extract_article_text(url):
     try:
-        article = Article(url)
+        config = Config()
+        config.browser_user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+        article = Article(url, config=config)
         article.download()
         article.parse()
         return article.text
